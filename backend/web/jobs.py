@@ -268,7 +268,7 @@ class RegistrationJobCoordinator:
 
         self.restore_from_database()
         gr._bs.allow_browser_launches()
-        count = max(1, min(int(count or 1), 1000))
+        count = max(1, int(count or 1))
         workers = max(1, min(int(workers or 1), 8, count))
 
         with self._lock:

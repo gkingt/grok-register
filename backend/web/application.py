@@ -363,7 +363,7 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 continue
             if key == "register_count":
-                value = max(1, min(value, 1000))
+                value = max(1, value)
             elif key == "register_workers":
                 value = max(1, min(value, 8))
             elif key == "outlookemail_top":

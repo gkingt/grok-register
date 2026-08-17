@@ -47,10 +47,11 @@ const MAX_LOG_BUFFER = 2000;
 const DEFAULT_RENDERED_LOGS = 300;
 const LOG_RENDER_STEP = 300;
 
-function normalizeInteger(value: string | number, min: number, max: number, fallback = min) {
+function normalizeInteger(value: string | number, min: number, max?: number, fallback = min) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(max, parsed));
+  const bounded = typeof max === "number" ? Math.min(max, parsed) : parsed;
+  return Math.max(min, bounded);
 }
 
 function formatDuration(seconds: number) {
@@ -245,7 +246,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     api
       .getConfig()
       .then((data) => {
-        setCount(String(normalizeInteger(data.config.register_count || 1, 1, 1000)));
+        setCount(String(normalizeInteger(data.config.register_count || 1, 1)));
         setWorkers(String(normalizeInteger(data.config.register_workers || 1, 1, 8)));
       })
       .catch(() => undefined);
@@ -369,7 +370,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const onStart = async () => {
     setBusyAction("start");
     try {
-      const normalizedCount = normalizeInteger(count, 1, 1000);
+      const normalizedCount = normalizeInteger(count, 1);
       const normalizedWorkers = normalizeInteger(workers, 1, 8);
       setCount(String(normalizedCount));
       setWorkers(String(normalizedWorkers));
@@ -491,13 +492,12 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                     type="number"
                     inputMode="numeric"
                     min={1}
-                    max={1000}
                     value={count}
                     disabled={!!job?.running}
                     onChange={(event) => setCount(event.target.value)}
-                    onBlur={() => setCount(String(normalizeInteger(count, 1, 1000)))}
+                    onBlur={() => setCount(String(normalizeInteger(count, 1)))}
                   />
-                  <p className="text-xs text-slate-500">支持 1–1000 个账号。</p>
+                  <p className="text-xs text-slate-500">支持 1 个及以上账号。</p>
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="workers">并发浏览器</Label>
