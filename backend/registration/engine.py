@@ -26,6 +26,7 @@ from curl_cffi import requests
 
 # 授权交换和导出逻辑集中在 integrations 包，编排层只负责调用。
 from backend.integrations import auth_exchange as _s2cpa
+from backend.integrations import exit_ip as _exit_ip
 from backend.integrations import grokiq as _grokiq
 from backend.integrations import grok2api_client as _grok2api
 from backend.integrations import sub2api_client as _sub2api
@@ -244,6 +245,25 @@ def backfill_registration_risk_bot_risk(log_callback=None) -> int:
     return updated
 
 
+def backfill_grokiq_degraded_bot_risk(log_callback=None) -> int:
+    """把已回传的 GrokIQ 降智结果回填成风控标记。"""
+    try:
+        repo = get_registration_repository()
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] GrokIQ 降智风控回填初始化失败: {exc}")
+        return 0
+    try:
+        updated = repo.backfill_grokiq_degraded_bot_risk()
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] GrokIQ 降智风控回填失败: {exc}")
+        return 0
+    if updated and log_callback:
+        log_callback(f"[*] 已将 {updated} 条 GrokIQ 降智记录标记为风控")
+    return updated
+
+
 def email_registered_successfully(email):
     """数据库或旧账号文件中已有成功/已消耗记录时返回 True。
 
@@ -298,6 +318,7 @@ DEFAULT_CONFIG = {
     "outlookemail_api_key": "",
     "outlookemail_source": "accounts",
     "outlookemail_group_id": "",
+    "outlookemail_code_timeout_group_id": "",
     "outlookemail_web_password": "",
     "outlookemail_session_cookie": "",
     "outlookemail_temp_tag_ids": "",
@@ -313,6 +334,8 @@ DEFAULT_CONFIG = {
     ),
     "browser_headless": False,
     "browser_locale": "en-US",
+    "browser_low_traffic_mode": True,
+    "browser_traffic_savings_level": "more",
     "close_browser_on_stop": False,
     "log_level": "info",
     "register_count": 1,
@@ -322,6 +345,8 @@ DEFAULT_CONFIG = {
     "cpa_auto_add": True,
     # 获取 SSO 后使用完整账号页解析器复查会话、邮箱与 botFlag 风控字段。
     "sso_detailed_risk_check": False,
+    # 注册完成后复查 grok.com botFlag；上游不再稳定提供该字段，默认跳过耗时复查。
+    "cpa_registration_risk_check": False,
     # Token 换取方式：device_protocol（协议 Device Flow，默认）/ device_browser（浏览器 Device Flow）/ auth_code
     "cpa_token_mode": "device_protocol",
     # CPA 本地 auth 目录
@@ -336,6 +361,9 @@ DEFAULT_CONFIG = {
     "grok2api_remote_username": "",
     "grok2api_remote_password": "",
     "grok2api_auto_import": True,
+    "grok2api_auto_import_build": True,
+    "grok2api_auto_import_web": False,
+    "grok2api_auto_import_console": False,
     # CPA 远程上传开关（独立于 cpa_auto_add；后者控制整个 SSO→auth 链路）
     "cpa_upload_enabled": True,
     # Sub2API：注册拿到 SSO 后直接上传 sso-to-oauth
@@ -416,6 +444,64 @@ class RegistrationRiskDenied(Exception):
         self.bot_flag_source = bot_flag_source
         self.bot_flag_details = str(bot_flag_details or "")
         self.risk_state = dict(risk_state or {})
+
+
+def prepare_registration_exit_ip(log_callback=None) -> str:
+    """打开注册页前，在浏览器里识别出口 IP，并尽量避开已风控出口。"""
+    return _exit_ip.ensure_unflagged_exit_ip(
+        store=get_registration_repository(),
+        proxy_enabled=bool(get_proxies()),
+        log_callback=log_callback,
+        restart=lambda: restart_browser(log_callback=log_callback),
+    )
+
+
+def remember_registration_risk_exit_ip(exc, email="", log_callback=None) -> bool:
+    """注册风控时再测一次浏览器出口 IP 再入库。
+
+    动态代理池可能在打开注册页后换出口，不能直接用注册前缓存的 IP。
+    """
+    if not getattr(exc, "bot_risk", False):
+        return False
+    started_ip = _exit_ip.current_start_exit_ip() or _exit_ip.current_exit_ip()
+    ip = _exit_ip.refresh_browser_exit_ip(
+        log_callback=log_callback,
+        reason="注册风控时",
+    ) or started_ip
+    if not ip:
+        if log_callback:
+            log_callback("[出口IP] 注册风控，但本次未识别到浏览器出口 IP，无法记录")
+        return False
+    try:
+        saved = get_registration_repository().remember_flagged_exit_ip(
+            ip,
+            email=email,
+            bot_flag_source=getattr(exc, "bot_flag_source", None),
+            failure_reason=str(exc),
+        )
+    except Exception as store_exc:
+        if log_callback:
+            log_callback(f"[出口IP] 记录风控出口 IP {ip} 失败: {store_exc}")
+        return False
+    if saved and log_callback:
+        if started_ip and started_ip != ip:
+            log_callback(
+                f"[出口IP] 注册风控，已记录出口 IP {ip}（打开注册页时是 {started_ip}）"
+            )
+        else:
+            log_callback(f"[出口IP] 注册风控，已记录出口 IP {ip}")
+    return bool(saved)
+
+
+def mark_registration_risk(cpa_detail, exc, *, email="", log_callback=None) -> None:
+    if isinstance(cpa_detail, dict):
+        cpa_detail.update(status="rejected", error=str(exc))
+    if apply_risk_bot_flag(cpa_detail, exc) and log_callback:
+        log_callback(
+            "[!] 注册风控标记 bot_risk"
+            f" botFlagSource={getattr(exc, 'bot_flag_source', None)!r}"
+        )
+    remember_registration_risk_exit_ip(exc, email=email, log_callback=log_callback)
 
 
 def apply_risk_bot_flag(cpa_detail: dict, exc) -> bool:
@@ -942,7 +1028,7 @@ def mailnest_receive_email(email):
     return mailnest_provider.receive_email(http_post, get_mailnest_api_key(), email)
 
 
-def mailnest_get_code(email, timeout=180, poll_interval=3, log_callback=None, cancel_callback=None):
+def mailnest_get_code(email, timeout=60, poll_interval=3, log_callback=None, cancel_callback=None):
     return mailnest_provider.wait_for_code(
         http_post,
         get_mailnest_api_key(),
@@ -966,6 +1052,26 @@ def get_outlookemail_api_key():
 
 def get_outlookemail_source():
     return outlookemail_provider.normalize_source(config.get("outlookemail_source", "accounts"))
+
+
+def get_outlookemail_group_id() -> str:
+    return str(config.get("outlookemail_group_id", "") or "").strip()
+
+
+def get_outlookemail_code_timeout_group_id() -> str:
+    return str(config.get("outlookemail_code_timeout_group_id", "") or "").strip()
+
+
+def list_outlookemail_groups() -> list[dict]:
+    return outlookemail_provider.list_groups(
+        http_get,
+        direct_http_session,
+        get_outlookemail_api_base(),
+        api_key=get_outlookemail_api_key(),
+        web_password=str(config.get("outlookemail_web_password", "") or ""),
+        session_cookie=str(config.get("outlookemail_session_cookie", "") or "").strip(),
+        proxies={},
+    )
 
 
 def _outlookemail_account_already_saved(email):
@@ -1180,34 +1286,117 @@ def outlookemail_get_email_and_token():
     )
 
 
+def maybe_move_outlookemail_for_code_timeout(
+    email,
+    *,
+    reason: str = "",
+    log_callback=None,
+) -> dict | None:
+    """验证码超时把 Outlook 邮箱移到指定分组，不停用。
+
+    只看 outlookemail_code_timeout_group_id：留空不移动，填了就移动。
+    不复用取号分组 outlookemail_group_id。
+    """
+    if not is_outlookemail_registration() or not str(email or "").strip():
+        return None
+    if get_outlookemail_source() != "accounts":
+        return None
+    target = get_outlookemail_code_timeout_group_id()
+    if not target:
+        return None
+    source = get_outlookemail_group_id()
+    if source and outlookemail_provider.same_group_id(source, target):
+        if log_callback:
+            log_callback("[!] 验证码超时目标分组与取号分组相同，跳过移动")
+        return {
+            "status": "skipped_same_group",
+            "account_id": "",
+            "group_id": target,
+            "error": "",
+        }
+
+    normalized_email = str(email).strip()
+    detail = {
+        "status": "not_attempted",
+        "account_id": "",
+        "group_id": target,
+        "error": "",
+    }
+    try:
+        if log_callback:
+            suffix = f"（{reason}）" if str(reason or "").strip() else ""
+            log_callback(
+                f"[OutlookEmail] 验证码超时，正在把邮箱移到分组 {target}: {normalized_email}{suffix}"
+            )
+        result = outlookemail_provider.move_account_to_group(
+            http_get,
+            direct_http_session,
+            get_outlookemail_api_base(),
+            normalized_email,
+            target,
+            api_key=get_outlookemail_api_key(),
+            group_id=source,
+            web_password=str(config.get("outlookemail_web_password", "") or ""),
+            session_cookie=str(config.get("outlookemail_session_cookie", "") or "").strip(),
+            proxies={},
+        )
+        detail.update(
+            status="success",
+            account_id=str(result.get("account_id") or ""),
+            group_id=str(result.get("group_id") or target),
+            error="",
+        )
+        if log_callback:
+            extra = "（原本已在该分组）" if result.get("already_moved") else ""
+            log_callback(
+                f"[+] 验证码超时：Outlook 邮箱已移到分组 {detail['group_id']}{extra}: {normalized_email}"
+            )
+    except Exception as exc:
+        detail.update(status="failed", error=str(exc))
+        if log_callback:
+            log_callback(f"[!] 验证码超时：Outlook 邮箱移动分组失败: {exc}")
+    return detail
+
+
 def outlookemail_get_oai_code(
     email,
-    timeout=180,
+    timeout=60,
     poll_interval=3,
     log_callback=None,
     cancel_callback=None,
     min_received_at=None,
 ):
-    return outlookemail_provider.wait_for_code(
-        http_get,
-        direct_http_session,
-        get_outlookemail_api_base(),
-        email,
-        api_key=get_outlookemail_api_key(),
-        source=get_outlookemail_source(),
-        web_password=str(config.get("outlookemail_web_password", "") or ""),
-        session_cookie=str(config.get("outlookemail_session_cookie", "") or "").strip(),
-        folder=str(config.get("outlookemail_folder", "all") or "all"),
-        top=config.get("outlookemail_top", 10),
-        proxies={},
-        timeout=timeout,
-        poll_interval=poll_interval,
-        min_received_at=min_received_at,
-        raise_if_cancelled=raise_if_cancelled,
-        sleep_with_cancel=sleep_with_cancel,
-        log_callback=log_callback,
-        cancel_callback=cancel_callback,
-    )
+    try:
+        return outlookemail_provider.wait_for_code(
+            http_get,
+            direct_http_session,
+            get_outlookemail_api_base(),
+            email,
+            api_key=get_outlookemail_api_key(),
+            source=get_outlookemail_source(),
+            web_password=str(config.get("outlookemail_web_password", "") or ""),
+            session_cookie=str(config.get("outlookemail_session_cookie", "") or "").strip(),
+            folder=str(config.get("outlookemail_folder", "all") or "all"),
+            top=config.get("outlookemail_top", 10),
+            proxies={},
+            timeout=timeout,
+            poll_interval=poll_interval,
+            min_received_at=min_received_at,
+            raise_if_cancelled=raise_if_cancelled,
+            sleep_with_cancel=sleep_with_cancel,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    except RegistrationCancelled:
+        raise
+    except Exception as exc:
+        if "未收到验证码" in str(exc):
+            maybe_move_outlookemail_for_code_timeout(
+                email,
+                reason=str(exc),
+                log_callback=log_callback,
+            )
+        raise
 
 
 def get_user_agent():
@@ -1306,6 +1495,8 @@ def ensure_sso_oauth_eligible(
 ) -> dict:
     """按配置复查 SSO 风控状态；详细模式同时验证会话与账号资料。"""
     detailed = bool(config.get("sso_detailed_risk_check", False))
+    if not detailed and not bool(config.get("cpa_registration_risk_check", False)):
+        return {}
     if not detailed:
         if not config.get("cpa_auto_add", False):
             return {}
@@ -1467,6 +1658,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
     g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
     g2a_remote_configured = _grok2api.Grok2APIClient.is_configured(config)
     g2a_auto_import = bool(config.get("grok2api_auto_import", False))
+    g2a_import_formats = _grok2api.Grok2APIClient.auto_import_formats(config)
     _set_result(
         cpa_remote_status="ready" if remote_url and management_key else "not_configured",
         grok2api_remote_status="ready" if g2a_remote_configured else "not_configured",
@@ -1626,16 +1818,22 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                 grok2api_auth_path_value = str(gpath)
                 auth_path_value = auth_path_value or str(gpath)
                 auth_entries.extend(f"Grok2API {kind}: {path}" for kind, path in gpaths.items())
-                if g2a_remote_configured and g2a_auto_import:
+                if g2a_remote_configured and g2a_import_formats:
                     _cpa_log(
                         "Grok2API 远程导入网络: 直连 -> "
-                        f"{str(config.get('grok2api_remote_url') or '').rstrip('/')}"
+                        f"{str(config.get('grok2api_remote_url') or '').rstrip('/')} "
+                        f"formats={','.join(g2a_import_formats)}"
                     )
                     remote_results = {}
                     remote_errors = {}
                     try:
                         with _grok2api.Grok2APIClient.from_config(config) as client:
-                            for format_name, format_path in gpaths.items():
+                            for format_name in g2a_import_formats:
+                                format_path = gpaths.get(format_name)
+                                if not format_path:
+                                    remote_errors[format_name] = "授权 JSON 不存在"
+                                    _cpa_log(f"Grok2API 远程导入跳过 [{format_name}]: 授权 JSON 不存在")
+                                    continue
                                 try:
                                     remote_result = client.import_auth_file(
                                         format_path, format_name=format_name
@@ -1681,6 +1879,8 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                         },
                     )
                 elif g2a_remote_configured:
+                    if g2a_auto_import and not g2a_import_formats:
+                        _cpa_log("已开启 Grok2API 自动导入，但未勾选 Build / Web / Console")
                     _set_result(grok2api_remote_status="ready")
             except Exception as g2a_exc:
                 _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
@@ -2035,7 +2235,7 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     return address, temp_token
 
 
-def yyds_get_oai_code(token, address, timeout=180, poll_interval=3, log_callback=None, jwt=None, cancel_callback=None):
+def yyds_get_oai_code(token, address, timeout=60, poll_interval=3, log_callback=None, jwt=None, cancel_callback=None):
     return yyds_provider.wait_for_code(
         http_get,
         token,
@@ -2087,7 +2287,7 @@ def cloudmail_get_email_and_token():
 def cloudmail_get_oai_code(
     dev_token,
     email,
-    timeout=180,
+    timeout=60,
     poll_interval=3,
     log_callback=None,
     cancel_callback=None,
@@ -2166,7 +2366,7 @@ def get_email_and_token(api_key=None):
 def get_oai_code(
     dev_token,
     email,
-    timeout=180,
+    timeout=60,
     poll_interval=3,
     log_callback=None,
     cancel_callback=None,
@@ -2239,7 +2439,7 @@ def extract_verification_code(text, subject=""):
 def duckmail_get_oai_code(
     dev_token,
     email,
-    timeout=180,
+    timeout=60,
     poll_interval=3,
     log_callback=None,
     cancel_callback=None,
@@ -2262,7 +2462,7 @@ def duckmail_get_oai_code(
 def cloudflare_get_oai_code(
     dev_token,
     email,
-    timeout=180,
+    timeout=60,
     poll_interval=3,
     log_callback=None,
     cancel_callback=None,
@@ -2699,6 +2899,17 @@ def get_browser_locale() -> str:
     return value if value in {"en-US", "zh-CN"} else "en-US"
 
 
+def is_browser_low_traffic_mode() -> bool:
+    return bool(config.get("browser_low_traffic_mode", False))
+
+
+def get_browser_traffic_savings_level() -> str:
+    value = str(config.get("browser_traffic_savings_level") or "more").strip().lower()
+    if value in {"standard", "less", "light"}:
+        return "standard"
+    return "more"
+
+
 def should_close_browser_after_run(user_stopped: bool) -> bool:
     """正常结束时非调试模式关闭；手动停止时严格以勾选项为准。"""
     if user_stopped:
@@ -2744,6 +2955,8 @@ def _wire_runtime_modules():
         is_headless=is_browser_headless,
         get_locale=get_browser_locale,
         get_engine=get_browser_engine,
+        is_low_traffic=is_browser_low_traffic_mode,
+        get_traffic_savings_level=get_browser_traffic_savings_level,
         extension_path=EXTENSION_PATH,
     )
     _rf.configure(
@@ -2755,6 +2968,7 @@ def _wire_runtime_modules():
         EmailDomainRejected=EmailDomainRejected,
         AccountRetryNeeded=AccountRetryNeeded,
         email_unavailable=email_registered_successfully,
+        prepare_exit_ip=prepare_registration_exit_ip,
     )
 
 # 页面步骤由 registration.signup_flow 实现。
@@ -2801,7 +3015,16 @@ def run_registration(count):
     registration_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（账号将不计成功）'}" + (f"（{_token_mode_label}）" if config.get('cpa_auto_add') else ""))
     # TokenAuth 各下游上传开关摘要，便于开跑时一眼确认
     _cpa_up = "开" if config.get("cpa_upload_enabled", True) else "关"
-    _g2a_up = "开" if config.get("grok2api_auto_import", False) else "关"
+    _g2a_formats = _grok2api.Grok2APIClient.auto_import_formats(config)
+    if _g2a_formats:
+        _g2a_labels = {
+            "grok_build": "build",
+            "grok_web": "web",
+            "grok_console": "console",
+        }
+        _g2a_up = "开(" + "/".join(_g2a_labels[name] for name in _g2a_formats) + ")"
+    else:
+        _g2a_up = "关"
     _s2a_up = "开" if config.get("sub2api_enabled", False) else "关"
     registration_log(f"[*] [TokenAuth] CPA上传={_cpa_up} Grok2API导入={_g2a_up} Sub2API={_s2a_up}")
     traceback_log_lock = threading.Lock()
@@ -2829,14 +3052,19 @@ def run_registration(count):
         return kind
 
     def _persist_result(*, started_at, worker_id=0, **kwargs):
+        extra = dict(kwargs.get("extra") or {})
+        exit_ip = _exit_ip.current_exit_ip()
+        start_exit_ip = _exit_ip.current_start_exit_ip()
+        if exit_ip:
+            extra["exit_ip"] = exit_ip
+        if start_exit_ip and start_exit_ip != exit_ip:
+            extra["exit_ip_at_start"] = start_exit_ip
         trace_text = ""
         if str(kwargs.get("status") or "").strip().lower() == "failure":
             trace_text = current_exception_traceback()
             if trace_text:
-                extra = dict(kwargs.get("extra") or {})
                 extra["exception_traceback"] = trace_text
                 extra["exception_type"] = trace_text.rstrip().splitlines()[-1]
-                kwargs["extra"] = extra
                 signature = hash(trace_text)
                 with traceback_log_lock:
                     should_log_traceback = signature not in logged_traceback_signatures
@@ -2847,6 +3075,8 @@ def run_registration(count):
                         "[异常堆栈]\n"
                         + current_exception_traceback(TRACEBACK_LOG_MAX_CHARS)
                     )
+        if extra:
+            kwargs["extra"] = extra
         if (
             str(kwargs.get("status") or "").strip().lower() == "failure"
             and str(kwargs.get("failure_type") or "") != FAIL_CPA
@@ -2885,8 +3115,14 @@ def run_registration(count):
             try:
                 boot_started_at = time.time()
                 try:
-                    start_browser(log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"))
+                    start_browser(
+                        log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                        cancel_callback=controller.should_stop,
+                    )
                 except Exception as boot_exc:
+                    if controller.should_stop():
+                        registration_log(f"[W{wid+1}] [!] 已停止，浏览器启动中断: {boot_exc}")
+                        return
                     local_fail = n
                     local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
                     registration_log(f"[W{wid+1}] [-] 浏览器启动失败，{n} 个任务均记为失败: {boot_exc}")
@@ -3106,12 +3342,12 @@ def run_registration(count):
                         i += 1
                         retry = 0
                         if kind == FAIL_RISK:
-                            cpa_detail.update(status="rejected", error=str(exc))
-                            if apply_risk_bot_flag(cpa_detail, exc):
-                                registration_log(
-                                    f"[W{wid+1}] [!] 注册风控标记 bot_risk"
-                                    f" botFlagSource={getattr(exc, 'bot_flag_source', None)!r}"
-                                )
+                            mark_registration_risk(
+                                cpa_detail,
+                                exc,
+                                email=current_attempt_email(email, exc),
+                                log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                            )
                         fail_email = current_attempt_email(email, exc)
                         email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
                             kind,
@@ -3175,8 +3411,11 @@ def run_registration(count):
     try:
         boot_started_at = time.time()
         try:
-            start_browser(log_callback=registration_log)
+            start_browser(log_callback=registration_log, cancel_callback=controller.should_stop)
         except Exception as boot_exc:
+            if controller.should_stop():
+                registration_log(f"[!] 已停止，浏览器启动中断: {boot_exc}")
+                return
             fail_count += count
             fail_stats[FAIL_BROWSER] = fail_stats.get(FAIL_BROWSER, 0) + count
             registration_log(f"[-] 浏览器启动失败，{count} 个任务均记为失败: {boot_exc}")
@@ -3258,7 +3497,7 @@ def run_registration(count):
                                 extra={"邮箱已更换重试": True, "邮箱尝试次数": mail_try},
                             )
                             registration_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=registration_log)
+                            restart_browser(log_callback=registration_log, cancel_callback=controller.should_stop)
                             sleep_with_cancel(1, controller.should_stop)
                             continue
                         raise
@@ -3441,12 +3680,12 @@ def run_registration(count):
                 retry_count_for_slot = 0
                 i += 1
                 if kind == FAIL_RISK:
-                    cpa_detail.update(status="rejected", error=str(exc))
-                    if apply_risk_bot_flag(cpa_detail, exc):
-                        registration_log(
-                            "[!] 注册风控标记 bot_risk"
-                            f" botFlagSource={getattr(exc, 'bot_flag_source', None)!r}"
-                        )
+                    mark_registration_risk(
+                        cpa_detail,
+                        exc,
+                        email=current_attempt_email(email, exc),
+                        log_callback=registration_log,
+                    )
                 fail_email = current_attempt_email(email, exc)
                 email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
                     kind,
