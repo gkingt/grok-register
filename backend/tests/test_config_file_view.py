@@ -87,13 +87,39 @@ class ProxyConfigUpdateTests(unittest.TestCase):
         self.assertIs(result["config"]["browser_low_traffic_mode"], True)
         save.assert_called_once_with()
 
-    def test_traffic_savings_level_accepts_standard_and_falls_back_to_more(self):
-        with patch.object(gr, "load_config"), patch.object(gr, "save_config"):
-            selected = _apply_config_updates({"browser_traffic_savings_level": "standard"})
-            fallback = _apply_config_updates({"browser_traffic_savings_level": "unknown"})
+    def test_legacy_api_traffic_levels_are_saved_as_standard(self):
+        for level in (None, "standard", "more", "max", "aggressive", "unknown"):
+            with self.subTest(level=level), patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
+                result = _apply_config_updates({"browser_traffic_savings_level": level})
 
-        self.assertEqual(selected["config"]["browser_traffic_savings_level"], "standard")
-        self.assertEqual(fallback["config"]["browser_traffic_savings_level"], "more")
+                self.assertEqual(result["config"]["browser_traffic_savings_level"], "standard")
+                self.assertEqual(gr.config["browser_traffic_savings_level"], "standard")
+                save.assert_called_once_with()
+
+    def test_legacy_config_load_and_save_preserve_other_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            for enabled in (False, True):
+                with self.subTest(enabled=enabled), patch.object(gr, "CONFIG_FILE", str(path)):
+                    original = {
+                        "browser_traffic_savings_level": "more",
+                        "browser_low_traffic_mode": enabled,
+                        "proxy": "http://proxy.example.com:8080",
+                        "custom_setting": "preserved",
+                    }
+                    path.write_text(json.dumps(original), encoding="utf-8")
+
+                    loaded = gr.load_config()
+                    self.assertEqual(loaded["browser_traffic_savings_level"], "standard")
+                    self.assertIs(loaded["browser_low_traffic_mode"], enabled)
+                    gr.config["browser_traffic_savings_level"] = "more"
+                    gr.save_config()
+
+                    saved = json.loads(path.read_text(encoding="utf-8"))
+                    self.assertEqual(saved["browser_traffic_savings_level"], "standard")
+                    self.assertIs(saved["browser_low_traffic_mode"], enabled)
+                    self.assertEqual(saved["proxy"], original["proxy"])
+                    self.assertEqual(saved["custom_setting"], original["custom_setting"])
 
     def test_code_timeout_group_id_defaults_to_blank(self):
         self.assertEqual(gr.DEFAULT_CONFIG["outlookemail_code_timeout_group_id"], "")
@@ -103,17 +129,14 @@ class ProxyConfigUpdateTests(unittest.TestCase):
         paths = {getattr(route, "path", "") for route in app.routes}
         self.assertIn("/api/outlookemail/groups", paths)
 
-    def test_missing_traffic_savings_level_defaults_to_more(self):
-        self.assertEqual(gr.DEFAULT_CONFIG["browser_traffic_savings_level"], "more")
-        original = gr.config.get("browser_traffic_savings_level", "missing")
-        try:
-            gr.config.pop("browser_traffic_savings_level", None)
-            self.assertEqual(gr.get_browser_traffic_savings_level(), "more")
-        finally:
-            if original == "missing":
-                gr.config.pop("browser_traffic_savings_level", None)
-            else:
-                gr.config["browser_traffic_savings_level"] = original
+    def test_missing_and_legacy_traffic_levels_always_use_standard(self):
+        self.assertEqual(gr.DEFAULT_CONFIG["browser_traffic_savings_level"], "standard")
+        gr.config.pop("browser_traffic_savings_level", None)
+        self.assertEqual(gr.get_browser_traffic_savings_level(), "standard")
+        for level in (None, "more", "max", "unknown"):
+            with self.subTest(level=level):
+                gr.config["browser_traffic_savings_level"] = level
+                self.assertEqual(gr.get_browser_traffic_savings_level(), "standard")
 
     def test_browser_engine_accepts_cloakbrowser_and_falls_back_to_camoufox(self):
         with patch.object(gr, "load_config"), patch.object(gr, "save_config"):
