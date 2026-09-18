@@ -616,20 +616,10 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
               />
               <ToggleRow
                 title="低流量注册模式"
-                description="缓存静态资源并跳过非必需媒体；不拦截注册页文档，避免代理超时"
+                description="缓存 Grok 静态资源并跳过非必需媒体；注册站资源正常联网"
                 checked={!!config.browser_low_traffic_mode}
                 onCheckedChange={(value) => setField("browser_low_traffic_mode", value)}
               />
-              {config.browser_low_traffic_mode ? (
-                <Select
-                  id="browser_traffic_savings_level"
-                  value={config.browser_traffic_savings_level === "standard" ? "standard" : "more"}
-                  onChange={(event) => setField("browser_traffic_savings_level", event.target.value)}
-                >
-                  <option value="standard">较少节省</option>
-                  <option value="more">更多节省</option>
-                </Select>
-              ) : null}
               <ToggleRow
                 title="停止时关闭浏览器"
                 description="收到停止请求后清理当前浏览器实例"

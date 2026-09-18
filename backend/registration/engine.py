@@ -335,7 +335,7 @@ DEFAULT_CONFIG = {
     "browser_headless": False,
     "browser_locale": "en-US",
     "browser_low_traffic_mode": True,
-    "browser_traffic_savings_level": "more",
+    "browser_traffic_savings_level": "standard",
     "close_browser_on_stop": False,
     "log_level": "info",
     "register_count": 1,
@@ -844,6 +844,8 @@ def load_config():
     config["browser_engine"] = _bs.normalize_browser_engine(
         config.get("browser_engine", "camoufox")
     )
+    # 兼容旧配置中的 more / max，所有省流档位统一使用较少节省。
+    config["browser_traffic_savings_level"] = "standard"
     return config
 
 
@@ -872,6 +874,7 @@ def parse_account_interval() -> float:
 
 
 def save_config():
+    config["browser_traffic_savings_level"] = "standard"
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
@@ -2904,10 +2907,8 @@ def is_browser_low_traffic_mode() -> bool:
 
 
 def get_browser_traffic_savings_level() -> str:
-    value = str(config.get("browser_traffic_savings_level") or "more").strip().lower()
-    if value in {"standard", "less", "light"}:
-        return "standard"
-    return "more"
+    """兼容旧调用，省流策略固定为较少节省。"""
+    return "standard"
 
 
 def should_close_browser_after_run(user_stopped: bool) -> bool:
