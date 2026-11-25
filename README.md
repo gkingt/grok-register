@@ -224,7 +224,7 @@ Windows 启动：
 | `proxy` | 注册和 OAuth 请求使用的 HTTP(S) 代理；支持 `http://host:port` 和 `http://user:password@host:port`，凭据中的特殊字符需使用 URL 百分号编码。注册风控会记录浏览器识别到的出口 IP；下次若仍是该 IP，会重启浏览器换出口后再注册。风控名单在「账号中心 → 出口 IP 风控」查看，单账号出口 IP 在「账号中心 → 账号管理 → 查看」详情中 |
 | `browser_engine` | 浏览器后端：`camoufox`（默认）或 `cloakbrowser` |
 | `browser_headless` | 本机无头模式；Docker 中强制关闭 |
-| `browser_low_traffic_mode` | 低流量注册模式，默认开启，仅保留原“较少节省”策略：缓存 grok.com CDN 静态资源并跳过非必需媒体。accounts.x.ai 的所有资源、注册 API 和 Cloudflare 挑战走浏览器原生网络 |
+| `browser_low_traffic_mode` | 低流量模式，默认开启。注册和重新登录共用 cdn.grok.com 静态资源缓存，并跳过非必需媒体；accounts.x.ai 资源走浏览器原生网络。设置页可查看和清空缓存 |
 | `browser_traffic_savings_level` | 旧配置兼容字段，固定为 `standard`；旧版的 `more` / `max` 等值在读取或保存时统一为 `standard`，界面不再提供档位选择 |
 | `cpa_auto_add` | 注册后生成 CPA 授权 |
 | `sso_detailed_risk_check` | 获取 SSO 后尝试读取账号页 `botFlagSource`。上游已不再稳定下发 `bfs` / `botFlag`，该检查不能作为风控结论；账号级降智检测请用 GrokIQ |
@@ -294,7 +294,7 @@ cd front && npm run build
 ## 新版本检测
 
 服务启动后会读取根目录 `VERSION`，立即查询一次 GitHub Releases，之后每
-1 小时复查。发现高于当前版本的正式 Release 时，管理控制台会自动弹出更新提示，
+15 分钟复查。发现高于当前版本的正式 Release 时，管理控制台会自动弹出更新提示，
 展示版本号、Markdown 更新说明和 Release 链接；关闭后同一版本不再重复弹出，更高版本
 发布后会重新提示。Release 正文按 GitHub Markdown 渲染，标题、列表、链接和代码块会显示在弹窗里。
 

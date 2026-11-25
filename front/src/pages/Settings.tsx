@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import {
   ArrowRight,
   Cloud,
+  Database,
   Eye,
   EyeOff,
   HelpCircle,
@@ -11,9 +12,10 @@ import {
   Save,
   Settings2,
   ShieldCheck,
+  Trash2,
   Webhook,
 } from "lucide-react";
-import { api, type OutlookEmailGroup } from "@/lib/api";
+import { api, type BrowserCacheSnapshot, type OutlookEmailGroup } from "@/lib/api";
 import {
   Button,
   buttonVariants,
@@ -101,6 +103,32 @@ const CLOUDFLARE_AUTH_MODES = [
   { value: "query-key", label: "URL 参数 key" },
 ];
 
+function formatCacheBytes(value: number) {
+  const size = Math.max(0, Number(value) || 0);
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function cacheScopeLabel(scope: string) {
+  if (scope === "standard") return "Grok CDN";
+  if (scope === "more") return "旧版账号站缓存";
+  return "未分类";
+}
+
+function cacheRiskLabel(level: string | undefined) {
+  if (level === "high") return "高风险";
+  if (level === "medium") return "中风险";
+  if (level === "low") return "低风险";
+  return "未检测";
+}
+
+function cacheRiskClass(level: string | undefined) {
+  if (level === "high") return "text-red-700";
+  if (level === "medium") return "text-amber-700";
+  return "text-slate-500";
+}
+
 function ToggleRow({
   title,
   description,
@@ -121,6 +149,119 @@ function ToggleRow({
         {description ? <div className="mt-0.5 text-xs leading-5 text-muted-foreground">{description}</div> : null}
       </div>
       <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} label={title} />
+    </div>
+  );
+}
+
+function cacheEntryActive(entry: { scope: string; replay_safe?: boolean }, config: Record<string, any>) {
+  return !!config.browser_low_traffic_mode && entry.scope === "standard" && entry.replay_safe !== false;
+}
+
+function LowTrafficCachePanel({
+  config,
+  snapshot,
+  loading,
+  clearing,
+  onRefresh,
+  onClear,
+}: {
+  config: Record<string, any>;
+  snapshot: BrowserCacheSnapshot | null;
+  loading: boolean;
+  clearing: boolean;
+  onRefresh: () => void;
+  onClear: () => void;
+}) {
+  const entries = snapshot?.entries || [];
+  const activeEntries = entries.filter((item) => cacheEntryActive(item, config));
+  const activeBytes = activeEntries.reduce((sum, item) => sum + (item.size || 0), 0);
+  const highRiskEntries = entries.filter((item) => item.risk_level === "high");
+  const highRiskBytes = highRiskEntries.reduce((sum, item) => sum + (item.size || 0), 0);
+  const currentLevel = config.browser_low_traffic_mode ? "已开启" : "未开启";
+  return (
+    <div className="space-y-3 rounded-xl border bg-muted/35 px-3 py-3 sm:px-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Database className="h-4 w-4" aria-hidden="true" />
+            静态资源缓存
+          </div>
+          <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+            低流量模式只复用 Grok CDN 静态资源。清空后，后续请求会重新填充缓存。
+          </p>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading || clearing}>
+            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+            刷新
+          </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={onClear}
+            disabled={loading || clearing || !snapshot?.entry_count}
+          >
+            <Trash2 className="h-4 w-4" />
+            {clearing ? "清空中" : "清空缓存"}
+          </Button>
+        </div>
+      </div>
+      <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-4">
+        <div>当前模式：<span className="font-medium text-foreground">{currentLevel}</span></div>
+        <div>磁盘缓存：<span className="font-medium text-foreground">{snapshot ? `${snapshot.entry_count} 个 / ${formatCacheBytes(snapshot.total_bytes)}` : (loading ? "读取中…" : "未读取")}</span></div>
+        <div>当前生效：<span className="font-medium text-foreground">{snapshot ? `${activeEntries.length} 个 / ${formatCacheBytes(activeBytes)}` : "—"}</span></div>
+        <div>风险文件：<span className="font-medium text-foreground">{snapshot ? `高 ${snapshot.high_risk_count || 0} / 中 ${snapshot.medium_risk_count || 0}` : "—"}</span></div>
+      </div>
+      {highRiskEntries.length ? (
+        <p className="text-xs leading-5 text-amber-700">
+          已识别 {highRiskEntries.length} 个高风险缓存文件（{formatCacheBytes(highRiskBytes)}）。这些文件仅保留在磁盘供核对。
+        </p>
+      ) : null}
+      {entries.length ? (
+        <div className="max-h-64 overflow-auto rounded-lg border bg-white">
+          <table className="w-full text-left text-xs">
+            <thead className="sticky top-0 bg-slate-50 text-slate-500">
+              <tr>
+                <th className="px-3 py-2 font-medium">状态</th>
+                <th className="px-3 py-2 font-medium">资源</th>
+                <th className="px-3 py-2 font-medium">风险</th>
+                <th className="px-3 py-2 font-medium">来源</th>
+                <th className="px-3 py-2 font-medium text-right">大小</th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((item) => {
+                const active = cacheEntryActive(item, config);
+                const name = (item.path || "").split("/").filter(Boolean).pop() || item.url || item.id;
+                const reasons = (item.risk_reasons || []).join("；");
+                return (
+                  <tr key={item.id} className="border-t border-slate-100">
+                    <td className="px-3 py-2">
+                      <span className={active ? "text-emerald-700" : "text-slate-400"}>
+                        {active ? "生效" : (item.replay_safe === false ? "跳过回放" : "未启用")}
+                      </span>
+                    </td>
+                    <td className="max-w-[18rem] px-3 py-2">
+                      <div className="truncate font-medium text-foreground" title={item.url || item.id}>{name}</div>
+                      <div className="truncate text-[11px] text-slate-400" title={item.url}>{item.host || "未知来源"}</div>
+                    </td>
+                    <td className="max-w-[14rem] px-3 py-2">
+                      <div className={`font-medium ${cacheRiskClass(item.risk_level)}`}>{cacheRiskLabel(item.risk_level)}</div>
+                      {reasons ? <div className="truncate text-[11px] text-slate-400" title={reasons}>{reasons}</div> : null}
+                    </td>
+                    <td className="px-3 py-2 text-slate-500">{cacheScopeLabel(item.scope)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums text-slate-600">{formatCacheBytes(item.size)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          {loading ? "正在读取缓存…" : "还没有缓存文件。开启低流量模式后，首次打开注册页或重新登录页会自动下载并保存。"}
+        </p>
+      )}
     </div>
   );
 }
@@ -344,6 +485,9 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
   const [outlookGroups, setOutlookGroups] = useState<OutlookEmailGroup[]>([]);
   const [outlookGroupsLoading, setOutlookGroupsLoading] = useState(false);
   const [outlookGroupsError, setOutlookGroupsError] = useState("");
+  const [cacheSnapshot, setCacheSnapshot] = useState<BrowserCacheSnapshot | null>(null);
+  const [cacheLoading, setCacheLoading] = useState(false);
+  const [cacheClearing, setCacheClearing] = useState(false);
 
   const showToast = (message: string, tone: "default" | "success" | "error" = "default") => {
     setToast({ message, tone });
@@ -388,6 +532,37 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
     }
   }, [section]);
 
+  const loadBrowserCache = async () => {
+    setCacheLoading(true);
+    try {
+      const data = await api.browserCache();
+      setCacheSnapshot(data);
+    } catch (err: any) {
+      showToast(err.message || "读取缓存失败", "error");
+    } finally {
+      setCacheLoading(false);
+    }
+  };
+
+  const clearBrowserCache = async () => {
+    if (!window.confirm("清空本地静态资源缓存？开启低流量模式时，后续请求会重新填充缓存。")) {
+      return;
+    }
+    setCacheClearing(true);
+    try {
+      const data = await api.clearBrowserCache();
+      setCacheSnapshot(data);
+      showToast(
+        data.deleted_files ? `已清空 ${data.deleted_files} 个缓存文件` : "缓存已清空",
+        "success",
+      );
+    } catch (err: any) {
+      showToast(err.message || "清空缓存失败", "error");
+    } finally {
+      setCacheClearing(false);
+    }
+  };
+
   const setField = (key: string, value: any) => {
     setConfig((previous) => ({ ...previous, [key]: value }));
   };
@@ -418,6 +593,12 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
   );
   const [generalTab, setGeneralTab] = useState<"task" | "browser" | "behavior">("task");
   const [authTab, setAuthTab] = useState<"conversion" | "cpa" | "grok2api" | "sub2api">("conversion");
+
+  useEffect(() => {
+    if (isRegistrationWorkspace && registrationTab === "general" && generalTab === "behavior") {
+      void loadBrowserCache();
+    }
+  }, [section, registrationTab, generalTab]);
   const meta = isRegistrationWorkspace ? SECTION_META.registration : SECTION_META[section];
 
   const selectRegistrationTab = (tab: "general" | "tokenauth") => {
@@ -615,10 +796,18 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 onCheckedChange={(value) => setField("browser_headless", value)}
               />
               <ToggleRow
-                title="低流量注册模式"
-                description="缓存 Grok 静态资源并跳过非必需媒体；注册站资源正常联网"
+                title="低流量模式"
+                description="注册和重新登录共用 Grok CDN 静态资源缓存，并跳过非必需媒体"
                 checked={!!config.browser_low_traffic_mode}
                 onCheckedChange={(value) => setField("browser_low_traffic_mode", value)}
+              />
+              <LowTrafficCachePanel
+                config={config}
+                snapshot={cacheSnapshot}
+                loading={cacheLoading}
+                clearing={cacheClearing}
+                onRefresh={() => void loadBrowserCache()}
+                onClear={() => void clearBrowserCache()}
               />
               <ToggleRow
                 title="停止时关闭浏览器"

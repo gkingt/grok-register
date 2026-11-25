@@ -139,6 +139,9 @@ _LOW_TRAFFIC_CACHE_EXCLUDED_HEADERS = {
     "content-length",
     "transfer-encoding",
     "set-cookie",
+    "cf-ray",
+    "age",
+    "date",
 }
 _LOW_TRAFFIC_PASSTHROUGH_TYPES = {
     "document",
@@ -167,6 +170,32 @@ _LOW_TRAFFIC_BLOCK_EXTENSIONS = {
     ".woff",
     ".woff2",
 }
+_CACHE_RISK_SCAN_LIMIT = 2 * 1024 * 1024
+_CACHE_RISK_ORDER = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+# 命中任一标记即视为高风险：跨账号回放会污染设备指纹、登录遥测或 Turnstile 时序。
+_CACHE_RISK_HIGH_MARKERS = (
+    ("m.castle.io", "Castle 设备指纹 SDK"),
+    ("rtcpeerconnection", "WebRTC ICE 出口探测"),
+    ("mozrtcpeerconnection", "WebRTC ICE 出口探测"),
+    ("gethighentropyvalues", "UA Client Hints 高熵指纹"),
+    ("api-js.mixpanel.com", "Mixpanel 分析 SDK"),
+    ("cdn.mxpnl.com", "Mixpanel 分析 SDK"),
+    ("challenges.cloudflare.com/turnstile", "Cloudflare Turnstile 加载器"),
+    ("reportturnstileerror", "Turnstile 错误上报"),
+    ("auth.turnstile.challenge", "Turnstile 挑战追踪"),
+    ("highlightturnstile", "Turnstile 登录校验脚本"),
+    ("api.axiom.co", "Axiom web-vitals 遥测"),
+    ("http.response_transfer_size", "Resource Timing 传输体积"),
+    ("device.processor_count", "Sentry 硬件信息采集"),
+)
+_CACHE_RISK_MEDIUM_MARKERS = (
+    ("connect.facebook.net", "广告像素 / 追踪脚本"),
+    ("ads-twitter.com", "广告像素 / 追踪脚本"),
+    ("analytics.twitter.com", "广告像素 / 追踪脚本"),
+    ("pixel-config.reddit.com", "广告像素 / 追踪脚本"),
+    ("navigator.webdriver", "自动化特征探测"),
+    ("web-vitals", "Web Vitals 性能埋点"),
+)
 _low_traffic_cache_pruned = False
 _low_traffic_cache_prune_lock = threading.Lock()
 
@@ -391,7 +420,13 @@ def _store_cached_response(url: str, status: int, headers: dict, body: bytes) ->
         temp_body.write_bytes(body)
         temp_meta.write_text(
             json.dumps(
-                {"status": status, "headers": filtered_headers, "size": len(body)},
+                {
+                    "status": status,
+                    "headers": filtered_headers,
+                    "size": len(body),
+                    "url": str(url),
+                    "cached_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
                 ensure_ascii=True,
                 separators=(",", ":"),
             ),
@@ -432,6 +467,211 @@ def _maybe_cache_low_traffic_response(response) -> None:
         return
 
 
+def _remember_cached_url(url: str) -> None:
+    """旧缓存没有 URL 字段时，命中后补写，方便设置页展示。"""
+    meta_path, _body_path = _low_traffic_cache_paths(url)
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict) or metadata.get("url"):
+            return
+        metadata["url"] = str(url)
+        if not metadata.get("cached_at"):
+            metadata["cached_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        suffix = f".{os.getpid()}.{threading.get_ident()}.tmp"
+        temp_meta = meta_path.with_name(meta_path.name + suffix)
+        temp_meta.write_text(
+            json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temp_meta, meta_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return
+
+
+def _short_cache_url(url: str) -> str:
+    try:
+        parsed = urlparse(str(url or ""))
+        host = parsed.hostname or ""
+        path = parsed.path or ""
+        if len(path) > 96:
+            path = path[:93] + "..."
+        return f"{host}{path}"
+    except ValueError:
+        return str(url or "")[:96]
+
+
+def path_looks_like_js(parsed) -> bool:
+    path = str(getattr(parsed, "path", "") or "").lower()
+    return path.endswith(".js") or "/_next/static/chunks/" in path
+
+
+def classify_low_traffic_cache_risk(url: str = "", body=b"", content_type: str = "") -> dict:
+    """根据缓存文件内容判断回放风险。高风险 JS 不回放，避免跨账号污染指纹。"""
+    ctype = str(content_type or "").lower()
+    path = ""
+    try:
+        path = (urlparse(str(url or "")).path or "").lower()
+    except ValueError:
+        path = str(url or "").lower()
+    if (
+        "text/css" in ctype
+        or "font/" in ctype
+        or "application/font" in ctype
+        or path.endswith((".css", ".woff", ".woff2", ".ttf", ".otf", ".eot"))
+    ):
+        return {
+            "level": "low",
+            "reasons": ["样式或字体，回放风险低"],
+            "replay_safe": True,
+        }
+    raw = body if isinstance(body, (bytes, bytearray)) else str(body or "").encode("utf-8", errors="ignore")
+    text_blob = bytes(raw[:_CACHE_RISK_SCAN_LIMIT]).decode("utf-8", errors="ignore")
+    blob = f"{url}\n{path}\n{text_blob}".lower()
+    reasons: list[str] = []
+    for needle, reason in _CACHE_RISK_HIGH_MARKERS:
+        if needle in blob and reason not in reasons:
+            reasons.append(reason)
+    if reasons:
+        return {"level": "high", "reasons": reasons, "replay_safe": False}
+    for needle, reason in _CACHE_RISK_MEDIUM_MARKERS:
+        if needle in blob and reason not in reasons:
+            reasons.append(reason)
+    if reasons:
+        return {"level": "medium", "reasons": reasons, "replay_safe": True}
+    return {"level": "low", "reasons": ["未发现指纹或遥测特征"], "replay_safe": True}
+
+
+def low_traffic_cache_scope(url: str) -> str:
+    """区分当前 CDN 缓存和旧版本写入的账号站缓存。"""
+    try:
+        parsed = urlparse(str(url or ""))
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except ValueError:
+        return "unknown"
+    if host in _LOW_TRAFFIC_CACHE_HOSTS:
+        return "standard"
+    if host == "accounts.x.ai" and "/_next/static/" in path:
+        return "more"
+    return "unknown"
+
+
+def _low_traffic_cache_entry_active(scope: str, replay_safe: bool = True) -> bool:
+    return low_traffic_enabled() and scope == "standard" and replay_safe
+
+
+def inspect_low_traffic_cache() -> dict:
+    """列出本地静态资源缓存，并标记当前可回放的条目。"""
+    root = _low_traffic_cache_root()
+    entries: list[dict] = []
+    total_bytes = 0
+    if root.is_dir():
+        try:
+            meta_files = list(root.glob("*.json"))
+        except OSError:
+            meta_files = []
+        for meta_path in meta_files:
+            body_path = meta_path.with_suffix(".bin")
+            try:
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                headers = metadata.get("headers") if isinstance(metadata.get("headers"), dict) else {}
+                url = str(metadata.get("url") or "")
+                scope = low_traffic_cache_scope(url) if url else "unknown"
+                body_size = body_path.stat().st_size if body_path.is_file() else 0
+                size = int(metadata.get("size") or body_size or 0)
+                total_bytes += size
+                parsed = urlparse(url) if url else None
+                mtime = body_path.stat().st_mtime if body_path.is_file() else meta_path.stat().st_mtime
+                content_type = str(headers.get("content-type") or "")
+                body = b""
+                if body_path.is_file() and (
+                    "javascript" in content_type.lower() or path_looks_like_js(parsed)
+                ):
+                    try:
+                        body = body_path.read_bytes()[:_CACHE_RISK_SCAN_LIMIT]
+                    except OSError:
+                        body = b""
+                risk = classify_low_traffic_cache_risk(url, body, content_type)
+                entries.append(
+                    {
+                        "id": meta_path.stem,
+                        "url": url,
+                        "host": ((parsed.hostname or "") if parsed else ""),
+                        "path": ((parsed.path or "") if parsed else ""),
+                        "content_type": content_type,
+                        "status": int(metadata.get("status") or 200),
+                        "size": size,
+                        "scope": scope,
+                        "risk_level": risk["level"],
+                        "risk_reasons": risk["reasons"],
+                        "replay_safe": bool(risk["replay_safe"]),
+                        "active": _low_traffic_cache_entry_active(
+                            scope, bool(risk["replay_safe"])
+                        ),
+                        "cached_at": str(metadata.get("cached_at") or ""),
+                        "mtime": mtime,
+                    }
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+    entries.sort(
+        key=lambda item: (
+            _CACHE_RISK_ORDER.get(str(item.get("risk_level") or "unknown"), 9),
+            -int(bool(item.get("active"))),
+            -int(item.get("size") or 0),
+            str(item.get("url") or item.get("id") or ""),
+        )
+    )
+    active_entries = [item for item in entries if item.get("active")]
+    high_risk = [item for item in entries if item.get("risk_level") == "high"]
+    medium_risk = [item for item in entries if item.get("risk_level") == "medium"]
+    return {
+        "enabled": low_traffic_enabled(),
+        "savings_level": traffic_savings_level() if low_traffic_enabled() else "",
+        "root": str(root),
+        "total_bytes": total_bytes,
+        "max_total_bytes": _LOW_TRAFFIC_CACHE_TOTAL_BYTES,
+        "max_entry_bytes": _LOW_TRAFFIC_CACHE_MAX_BYTES,
+        "entry_count": len(entries),
+        "active_count": len(active_entries),
+        "active_bytes": sum(int(item.get("size") or 0) for item in active_entries),
+        "high_risk_count": len(high_risk),
+        "medium_risk_count": len(medium_risk),
+        "high_risk_bytes": sum(int(item.get("size") or 0) for item in high_risk),
+        "refills_on_miss": True,
+        "entries": entries,
+    }
+
+
+def clear_low_traffic_cache() -> dict:
+    """删除本地静态资源缓存。开启低流量模式时，后续请求会重新填充缓存。"""
+    global _low_traffic_cache_pruned
+    root = _low_traffic_cache_root()
+    deleted = 0
+    errors = 0
+    if root.is_dir():
+        try:
+            names = list(root.iterdir())
+        except OSError:
+            names = []
+        for path in names:
+            if not path.is_file():
+                continue
+            if path.suffix not in {".json", ".bin", ".tmp"} and ".tmp" not in path.name:
+                continue
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError:
+                errors += 1
+    with _low_traffic_cache_prune_lock:
+        _low_traffic_cache_pruned = False
+    snapshot = inspect_low_traffic_cache()
+    snapshot["deleted_files"] = deleted
+    snapshot["errors"] = errors
+    return snapshot
+
+
 def _install_low_traffic_routing(browser_context, log_callback=None) -> None:
     if not low_traffic_enabled() or not hasattr(browser_context, "route"):
         return
@@ -456,10 +696,17 @@ def _install_low_traffic_routing(browser_context, log_callback=None) -> None:
         lock = _low_traffic_cache_lock(url)
         with lock:
             cached = _cached_response(url)
+            if cached is not None:
+                _remember_cached_url(url)
         if cached is not None:
             status, headers, body = cached
-            route.fulfill(status=status, headers=headers, body=body)
-            return
+            risk = classify_low_traffic_cache_risk(url, body, headers.get("content-type"))
+            if risk["replay_safe"]:
+                route.fulfill(status=status, headers=headers, body=body)
+                return
+            if log_callback:
+                reasons = "、".join(risk["reasons"])
+                log_callback(f"[!] 低流量缓存跳过回放: {_short_cache_url(url)}（{reasons}）")
         route.continue_()
 
     browser_context.route(low_traffic_should_intercept, handle)
